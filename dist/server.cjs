@@ -149,6 +149,38 @@ function ytRun(args) {
     });
   });
 }
+var COBALT_INSTANCES = (process.env.COBALT_INSTANCES || "https://dwnld.nichind.dev,https://co.eepy.today,https://cobalt-backend.canine.tools,https://cobalt-api.kwiatekmiki.com").split(",").map((s) => s.trim()).filter(Boolean);
+async function cobaltResolve(pageUrl, opts = {}) {
+  const body = opts.audioOnly ? { url: pageUrl, downloadMode: "audio", audioFormat: "mp3" } : { url: pageUrl, downloadMode: "auto", videoQuality: opts.quality || "1080" };
+  for (const base of COBALT_INSTANCES) {
+    try {
+      const r = await withTimeout(
+        fetch(base, {
+          method: "POST",
+          headers: { Accept: "application/json", "Content-Type": "application/json", "User-Agent": UA },
+          body: JSON.stringify(body)
+        }),
+        9e3,
+        null
+      );
+      if (!r || !r.ok) continue;
+      const j = await r.json();
+      if ((j.status === "tunnel" || j.status === "redirect") && j.url) return { url: j.url, filename: j.filename };
+      if (j.status === "picker" && j.picker?.length) return { url: j.picker[0].url, filename: j.filename };
+    } catch {
+    }
+  }
+  return null;
+}
+async function proxyRemote(res, remoteUrl, filename, isAudio) {
+  const upstream = await fetch(remoteUrl, { headers: { "User-Agent": UA } });
+  if (!upstream.ok || !upstream.body) throw new Error(`upstream ${upstream.status}`);
+  res.setHeader("Content-Type", isAudio ? "audio/mpeg" : "video/mp4");
+  const len = upstream.headers.get("content-length");
+  if (len) res.setHeader("Content-Length", len);
+  res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+  import_stream.Readable.fromWeb(upstream.body).pipe(res);
+}
 function humanSize(bytes) {
   if (!bytes || bytes <= 0) return "";
   const mb = bytes / (1024 * 1024);
@@ -440,6 +472,44 @@ function buildMedia(info) {
     audio
   };
 }
+async function fallbackMedia(pageUrl) {
+  let title = "Video";
+  let thumbnail = "";
+  try {
+    const o = await withTimeout(
+      fetch(`https://www.youtube.com/oembed?url=${encodeURIComponent(pageUrl)}&format=json`, {
+        headers: { "User-Agent": UA }
+      }).then((r) => r.ok ? r.json() : null),
+      6e3,
+      null
+    );
+    if (o?.title) title = o.title;
+    if (o?.thumbnail_url) thumbnail = o.thumbnail_url;
+  } catch {
+  }
+  const video = [1080, 720, 480, 360].map((hh) => ({
+    id: `v${hh}`,
+    height: hh,
+    label: `${hh}p`,
+    ext: "mp4",
+    size: null,
+    sizeText: "",
+    note: hh === 1080 ? "Best Quality" : ""
+  }));
+  const audio = [{ id: "audio", label: "MP3", ext: "mp3", bitrate: null, size: null, sizeText: "", note: "Audio" }];
+  return {
+    title,
+    thumbnail,
+    duration: "",
+    uploader: "",
+    source: "YouTube",
+    resolvedUrl: pageUrl,
+    previewUrl: `/api/stream?url=${encodeURIComponent(pageUrl)}`,
+    images: thumbnail ? [{ url: thumbnail, label: "Default", width: 0, height: 0 }] : [],
+    video,
+    audio
+  };
+}
 async function startServer() {
   const app = (0, import_express.default)();
   const PORT = Number(process.env.PORT) || 3e3;
@@ -549,8 +619,14 @@ async function startServer() {
           groups
         });
       }
-      const info = await ytDumpJson(resolved.url);
-      return res.json({ type: "media", aiNote: resolved.ai ? resolved.note : "", ...buildMedia(info) });
+      try {
+        if (process.env.FORCE_COBALT === "1" && isYouTubeTarget(resolved.url)) throw new Error("forced-cobalt");
+        const info = await ytDumpJson(resolved.url);
+        return res.json({ type: "media", aiNote: resolved.ai ? resolved.note : "", ...buildMedia(info) });
+      } catch (ytErr) {
+        const media = await fallbackMedia(resolved.url);
+        return res.json({ type: "media", aiNote: resolved.ai ? resolved.note : "", ...media });
+      }
     } catch (error) {
       console.error("Analyze error:", error?.stderr || error?.message || error);
       res.status(500).json({ error: mapError(error) });
@@ -559,12 +635,19 @@ async function startServer() {
   app.post("/api/info", async (req, res) => {
     const { url } = req.body || {};
     if (!url || !String(url).trim()) return res.status(400).json({ error: "Please enter a link." });
+    const clean = cleanUrl(String(url).trim());
     try {
-      const info = await ytDumpJson(cleanUrl(String(url).trim()));
+      if (process.env.FORCE_COBALT === "1" && isYouTubeTarget(clean)) throw new Error("forced-cobalt");
+      const info = await ytDumpJson(clean);
       res.json({ type: "media", aiNote: "", ...buildMedia(info) });
     } catch (error) {
-      console.error("Error fetching info:", error?.stderr || error?.message || error);
-      res.status(500).json({ error: mapError(error) });
+      console.error("Error fetching info (yt-dlp), using fallback:", error?.message || error);
+      try {
+        const media = await fallbackMedia(clean);
+        res.json({ type: "media", aiNote: "", ...media });
+      } catch (e2) {
+        res.status(500).json({ error: mapError(error) });
+      }
     }
   });
   app.get("/api/download", async (req, res) => {
@@ -573,6 +656,18 @@ async function startServer() {
     const quality = typeof format === "string" ? format : "best";
     const isMp3 = quality === "audio";
     const isNativeAudio = quality.startsWith("a:");
+    const wantAudio = isMp3 || isNativeAudio;
+    const cobQuality = quality.startsWith("v") ? quality.slice(1) : "1080";
+    if (process.env.FORCE_COBALT === "1" && isYouTubeTarget(url)) {
+      try {
+        const cob = await cobaltResolve(url, { quality: cobQuality, audioOnly: wantAudio });
+        if (cob?.url) return await proxyRemote(res, cob.url, cob.filename || `download.${wantAudio ? "mp3" : "mp4"}`, wantAudio);
+        return res.status(502).send("Could not fetch this link right now. Please try again.");
+      } catch (e) {
+        console.error("Cobalt (forced) failed:", e?.message || e);
+        return res.status(502).send("Could not fetch this link right now. Please try again.");
+      }
+    }
     const tmpBase = import_path.default.join(import_os.default.tmpdir(), `uvd-${Date.now()}-${process.pid}`);
     const outputTemplate = `${tmpBase}.%(ext)s`;
     let producedFile = null;
@@ -633,10 +728,23 @@ async function startServer() {
       });
       res.on("close", () => stream.destroy());
     } catch (error) {
-      console.error("Download error:", error?.stderr || error?.message || error);
+      console.error("Download error (yt-dlp):", error?.stderr || error?.message || error);
       if (producedFile) import_fs.default.unlink(producedFile, () => {
       });
-      if (!res.headersSent) res.status(500).send("Download failed: " + mapError(error));
+      if (!res.headersSent) {
+        try {
+          const h = quality.startsWith("v") ? quality.slice(1) : "1080";
+          const cob = await cobaltResolve(url, { quality: h, audioOnly: isMp3 || isNativeAudio });
+          if (cob?.url) {
+            console.log("[download] using Cobalt fallback");
+            const ext = isMp3 || isNativeAudio ? "mp3" : "mp4";
+            return await proxyRemote(res, cob.url, cob.filename || `download.${ext}`, isMp3 || isNativeAudio);
+          }
+        } catch (e) {
+          console.error("Cobalt fallback failed:", e?.message || e);
+        }
+        res.status(500).send("Download failed: " + mapError(error));
+      }
     }
   });
   if (process.env.NODE_ENV !== "production") {
