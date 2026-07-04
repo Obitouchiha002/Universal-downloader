@@ -322,14 +322,44 @@ function withTimeout(p, ms, fallback) {
   ]);
 }
 async function searchYouTube(query, n = 5) {
-  const data = await ytDumpJson(`ytsearch${n}:${query}`, ["--flat-playlist"]);
-  return (data.entries || []).filter((e) => e && (e.id || e.url)).map((e) => ({
-    url: e.url || `https://www.youtube.com/watch?v=${e.id}`,
-    title: e.title || "Untitled",
-    thumbnail: (e.thumbnails?.length ? e.thumbnails[e.thumbnails.length - 1].url : e.thumbnail) || (e.id ? `https://i.ytimg.com/vi/${e.id}/hqdefault.jpg` : ""),
-    channel: e.channel || e.uploader || "",
-    duration: durationText(e.duration)
-  })).filter((r) => r.url);
+  try {
+    const r = await fetch(
+      `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}&hl=en`,
+      { headers: { "User-Agent": UA, "Accept-Language": "en-US,en" } }
+    );
+    const html = await r.text();
+    const m = html.match(/ytInitialData\s*=\s*({.+?});\s*<\/script>/s);
+    if (m) {
+      const j = JSON.parse(m[1]);
+      const sections = j.contents?.twoColumnSearchResultsRenderer?.primaryContents?.sectionListRenderer?.contents || [];
+      const items = sections.flatMap((c) => c.itemSectionRenderer?.contents || []);
+      const out = items.filter((i) => i.videoRenderer?.videoId).slice(0, n).map((i) => {
+        const v = i.videoRenderer;
+        return {
+          url: `https://www.youtube.com/watch?v=${v.videoId}`,
+          title: v.title?.runs?.[0]?.text || "Untitled",
+          thumbnail: `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`,
+          channel: v.ownerText?.runs?.[0]?.text || v.longBylineText?.runs?.[0]?.text || "",
+          duration: v.lengthText?.simpleText || ""
+        };
+      });
+      if (out.length) return out;
+    }
+  } catch (e) {
+    console.error("YouTube scrape search failed, falling back to yt-dlp:", e?.message);
+  }
+  try {
+    const data = await ytDumpJson(`ytsearch${n}:${query}`, ["--flat-playlist"]);
+    return (data.entries || []).filter((e) => e && (e.id || e.url)).map((e) => ({
+      url: e.url || `https://www.youtube.com/watch?v=${e.id}`,
+      title: e.title || "Untitled",
+      thumbnail: (e.thumbnails?.length ? e.thumbnails[e.thumbnails.length - 1].url : e.thumbnail) || (e.id ? `https://i.ytimg.com/vi/${e.id}/hqdefault.jpg` : ""),
+      channel: e.channel || e.uploader || "",
+      duration: durationText(e.duration)
+    })).filter((r) => r.url);
+  } catch {
+    return [];
+  }
 }
 async function searchSoundCloud(query, n = 5) {
   const data = await ytDumpJson(`scsearch${n}:${query}`, ["--flat-playlist"]);
